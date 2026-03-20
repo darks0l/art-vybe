@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+contracts/artifacts/
+contracts/cache/
+contracts/typechain-types/
+frontend/.vercel/
+frontend/dist/
+*.log
