@@ -679,4 +679,84 @@ describe("Art Vybe Staking Platform", function () {
       ).to.equal(nativeFee);
     });
   });
+
+  describe("Creator Withdraw Protection", function () {
+    let poolContract;
+
+    beforeEach(async function () {
+      // Mint NFTs to staker1 (use high IDs to avoid collision with global beforeEach)
+      await mockNFT.mint(staker1.address, 100);
+      await mockNFT.mint(staker1.address, 101);
+
+      // Setup: creator creates a pool
+      await feeToken.mint(creator.address, CREATION_FEE);
+      await feeToken.connect(creator).approve(await stakingFactory.getAddress(), CREATION_FEE);
+      await rewardToken.mint(creator.address, TOTAL_REWARDS);
+      await rewardToken.connect(creator).approve(await stakingFactory.getAddress(), TOTAL_REWARDS);
+
+      const tx = await stakingFactory.connect(creator).createPool(
+        await mockNFT.getAddress(),
+        await rewardToken.getAddress(),
+        TOTAL_REWARDS,
+        DEFAULT_LOCK_DAYS,
+        POOL_NAME, POOL_DESC, POOL_LOGO
+      );
+      const receipt = await tx.wait();
+      const event = receipt.logs.find(l => l.fragment?.name === "PoolCreated");
+      const poolAddress = event.args.pool;
+      poolContract = await ethers.getContractAt("StakingPool", poolAddress);
+
+      // Staker1 stakes 2 NFTs
+      await mockNFT.connect(staker1).setApprovalForAll(poolAddress, true);
+      await poolContract.connect(staker1).stake([100, 101]);
+    });
+
+    it("should NOT allow creator to drain unclaimed staker rewards", async function () {
+      // Advance 180 days — staker has earned ~half the rewards
+      await time.increase(180 * 24 * 60 * 60);
+
+      // Pool expires
+      await time.increase(186 * 24 * 60 * 60);
+
+      // Staker has NOT claimed yet — rewards sitting in contract
+      const pendingRewards = await poolContract.earned(staker1.address);
+      expect(pendingRewards).to.be.gt(0);
+
+      // Creator withdraws — should only get the surplus, not staker funds
+      const balanceBefore = await rewardToken.balanceOf(creator.address);
+      await poolContract.connect(creator).creatorWithdraw();
+      const balanceAfter = await rewardToken.balanceOf(creator.address);
+      const withdrawn = balanceAfter - balanceBefore;
+
+      // Staker should still be able to claim their full rewards
+      const stakerBefore = await rewardToken.balanceOf(staker1.address);
+      await poolContract.connect(staker1).claimRewards();
+      const stakerAfter = await rewardToken.balanceOf(staker1.address);
+      const claimed = stakerAfter - stakerBefore;
+
+      expect(claimed).to.be.gt(0);
+      // Total withdrawn + claimed should not exceed total rewards
+      expect(withdrawn + claimed).to.be.lte(TOTAL_REWARDS);
+    });
+
+    it("should only allow creator to withdraw dust when all rewards are earned", async function () {
+      // Advance full year — all rewards earned by staker
+      await time.increase(POOL_DURATION + 1);
+
+      // Creator can only withdraw rounding dust (integer division remainder), not staker funds
+      const balanceBefore = await rewardToken.balanceOf(creator.address);
+      await poolContract.connect(creator).creatorWithdraw();
+      const balanceAfter = await rewardToken.balanceOf(creator.address);
+      const withdrawn = balanceAfter - balanceBefore;
+
+      // Withdrawn amount should be negligible dust (< 1 token from rounding)
+      expect(withdrawn).to.be.lt(ethers.parseEther("1"));
+
+      // Staker should still claim their full rewards
+      await poolContract.connect(staker1).claimRewards();
+      const stakerBalance = await rewardToken.balanceOf(staker1.address);
+      // Staker gets ~100k tokens (minus rounding dust)
+      expect(stakerBalance).to.be.gt(ethers.parseEther("99999"));
+    });
+  });
 });

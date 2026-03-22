@@ -60,6 +60,11 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
 
     uint256 public totalStaked;
 
+    /// @notice Total rewards earned by all stakers (accumulated globally)
+    uint256 public totalRewardsEarned;
+    /// @notice Total rewards already claimed by stakers
+    uint256 public totalRewardsClaimed;
+
     // Accumulator pattern
     uint256 public rewardPerTokenStored;
     uint256 public lastUpdateTime;
@@ -107,7 +112,13 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     }
 
     modifier updateReward(address account) {
-        rewardPerTokenStored = rewardPerToken();
+        uint256 newRewardPerToken = rewardPerToken();
+        uint256 delta = newRewardPerToken - rewardPerTokenStored;
+        // Track global rewards earned by all stakers (from accumulator delta × staked count)
+        if (delta > 0 && totalStaked > 0) {
+            totalRewardsEarned += (delta * totalStaked) / 1e18;
+        }
+        rewardPerTokenStored = newRewardPerToken;
         lastUpdateTime = lastTimeRewardApplicable();
         if (account != address(0)) {
             rewards[account] = earned(account);
@@ -321,11 +332,12 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
 
         bool earlyWithdrawal = isUserLocked(msg.sender);
 
-        // If early withdrawal, forfeit all pending rewards
+        // If early withdrawal, forfeit all pending rewards (returned to pool surplus)
         if (earlyWithdrawal) {
             uint256 forfeited = rewards[msg.sender];
             rewards[msg.sender] = 0;
             if (forfeited > 0) {
+                totalRewardsEarned -= forfeited;
                 emit RewardsForfeited(msg.sender, forfeited);
             }
         }
@@ -356,6 +368,7 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         require(reward > 0, "No rewards");
 
         rewards[msg.sender] = 0;
+        totalRewardsClaimed += reward;
         rewardToken.safeTransfer(msg.sender, reward);
 
         emit RewardsClaimed(msg.sender, reward);
@@ -365,13 +378,17 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     //  Creator Functions
     // ──────────────────────────────────────────────
 
-    /// @notice After pool expires, owner can withdraw remaining undistributed rewards
-    function creatorWithdraw() external onlyPoolOwner nonReentrant {
+    /// @notice After pool expires, owner can withdraw unearned rewards
+    /// @dev Only withdraws balance minus what stakers are still owed (unclaimed rewards).
+    ///      Staker funds are never touched — creator can only take truly surplus tokens.
+    function creatorWithdraw() external onlyPoolOwner nonReentrant updateReward(address(0)) {
         require(isExpired(), "Pool not expired");
-        uint256 remaining = rewardToken.balanceOf(address(this));
-        require(remaining > 0, "No remaining rewards");
-        rewardToken.safeTransfer(owner, remaining);
-        emit CreatorWithdraw(owner, remaining);
+        uint256 balance = rewardToken.balanceOf(address(this));
+        uint256 owedToStakers = totalRewardsEarned - totalRewardsClaimed;
+        require(balance > owedToStakers, "No withdrawable rewards");
+        uint256 withdrawable = balance - owedToStakers;
+        rewardToken.safeTransfer(owner, withdrawable);
+        emit CreatorWithdraw(owner, withdrawable);
     }
 
     // ──────────────────────────────────────────────
