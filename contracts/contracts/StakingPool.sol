@@ -7,7 +7,6 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title StakingPool
 /// @notice An NFT staking pool where stakers earn ERC-20 token rewards
@@ -20,10 +19,13 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 ///        - Each staker earns proportional to `(theirNFTs / totalStakedNFTs)` per second.
 ///        - As more NFTs enter the pool the individual rate dilutes, but total
 ///          emission stays constant.
+///        - Rewards only accrue while at least 1 NFT is staked. Periods with
+///          zero stakers emit nothing and those tokens remain for the creator.
 ///
 ///      **Lock period:**
 ///        - Pool creator sets a lock period (in days) at creation. Can be 0 for no lock.
 ///        - Each staker's lock starts from when THEY stake.
+///        - ⚠️ Staking additional NFTs RESETS the lock timer for ALL your staked NFTs.
 ///        - Early withdrawal (before lock expires) forfeits all pending rewards.
 ///        - After lock period: free exit, full rewards.
 ///
@@ -39,6 +41,9 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     /// @notice Pool lifetime: 365 days
     uint256 public constant POOL_DURATION = 365 days;
 
+    /// @notice Maximum NFTs a single user can stake (prevents unbounded gas)
+    uint256 public constant MAX_NFTS_PER_USER = 100;
+
     // ──────────────────────────────────────────────
     //  State
     // ──────────────────────────────────────────────
@@ -51,7 +56,7 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     IERC20 public rewardToken;
 
     uint256 public totalRewards;
-    uint256 public rewardRate; // tokens per second (scaled)
+    uint256 public rewardRate; // tokens per second
     uint256 public startTime;
     uint256 public endTime;
 
@@ -76,6 +81,9 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     mapping(address => uint256[]) internal _stakedTokenIds;
     mapping(uint256 => address) public tokenOwner; // tokenId -> staker
 
+    /// @dev tokenId -> index in _stakedTokenIds[owner] for O(1) removal
+    mapping(uint256 => uint256) internal _tokenIdIndex;
+
     /// @notice Timestamp when each user last staked (lock timer resets on new stake)
     mapping(address => uint256) public stakeTimestamp;
 
@@ -88,14 +96,20 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         address indexed nftCollection,
         address indexed rewardToken,
         uint256 totalRewards,
-        uint256 lockPeriodDays
+        uint256 rewardRate,
+        uint256 lockPeriodDays,
+        uint256 startTime,
+        uint256 endTime
     );
-    event Staked(address indexed user, uint256[] tokenIds);
-    event Unstaked(address indexed user, uint256[] tokenIds, bool earlyWithdrawal);
-    event RewardsClaimed(address indexed user, uint256 amount);
+    event Staked(address indexed user, uint256[] tokenIds, uint256 newStakedBalance, uint256 newTotalStaked);
+    event Unstaked(address indexed user, uint256[] tokenIds, bool earlyWithdrawal, uint256 newStakedBalance, uint256 newTotalStaked);
+    event RewardsClaimed(address indexed user, uint256 amount, uint256 totalClaimedByUser);
     event RewardsForfeited(address indexed user, uint256 amount);
-    event CreatorWithdraw(address indexed creator, uint256 amount);
+    event CreatorWithdraw(address indexed creator, uint256 amount, uint256 remainingBalance);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event LockTimerReset(address indexed user, uint256 lockEndsAt);
+    event PoolPaused(address indexed pausedBy);
+    event PoolUnpaused(address indexed unpausedBy);
 
     // ──────────────────────────────────────────────
     //  Modifiers
@@ -114,7 +128,7 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     modifier updateReward(address account) {
         uint256 newRewardPerToken = rewardPerToken();
         uint256 delta = newRewardPerToken - rewardPerTokenStored;
-        // Track global rewards earned by all stakers (from accumulator delta × staked count)
+        // Track global rewards earned by all stakers (from accumulator delta x staked count)
         if (delta > 0 && totalStaked > 0) {
             totalRewardsEarned += (delta * totalStaked) / 1e18;
         }
@@ -125,6 +139,16 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
             userRewardPerTokenPaid[account] = rewardPerTokenStored;
         }
         _;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Constructor (locks implementation)
+    // ──────────────────────────────────────────────
+
+    /// @dev Locks the implementation contract so it cannot be initialized directly.
+    ///      Only clones deployed by the factory can be initialized.
+    constructor() {
+        initialized = true;
     }
 
     // ──────────────────────────────────────────────
@@ -159,7 +183,16 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         endTime = block.timestamp + POOL_DURATION;
         lastUpdateTime = block.timestamp;
 
-        emit PoolInitialized(_creator, _nft, _rewardToken, _totalRewards, _lockPeriodDays);
+        emit PoolInitialized(
+            _creator,
+            _nft,
+            _rewardToken,
+            _totalRewards,
+            rewardRate,
+            _lockPeriodDays,
+            startTime,
+            endTime
+        );
     }
 
     // ──────────────────────────────────────────────
@@ -174,7 +207,7 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         owner = newOwner;
     }
 
-    /// @notice Renounce pool ownership (irreversible)
+    /// @notice Renounce pool ownership (irreversible — locks creatorWithdraw forever)
     function renounceOwnership() external onlyPoolOwner {
         emit OwnershipTransferred(owner, address(0));
         owner = address(0);
@@ -287,12 +320,18 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         return block.timestamp >= endTime;
     }
 
+    /// @notice Unclaimed rewards still owed to stakers
+    function totalUnclaimedRewards() external view returns (uint256) {
+        return totalRewardsEarned - totalRewardsClaimed;
+    }
+
     // ──────────────────────────────────────────────
     //  Staking
     // ──────────────────────────────────────────────
 
     /// @notice Stake one or more NFTs into the pool
-    /// @dev Resets the user's lock timer on each new stake action
+    /// @dev ⚠️ Resets the user's lock timer on each new stake action.
+    ///      If you have an active lock and stake more, the timer restarts for ALL your NFTs.
     /// @param tokenIds Array of token IDs to stake
     function stake(uint256[] calldata tokenIds)
         external
@@ -301,34 +340,44 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         updateReward(msg.sender)
     {
         require(!isExpired(), "Pool expired");
-        require(tokenIds.length > 0, "No tokens");
+        uint256 count = tokenIds.length;
+        require(count > 0, "No tokens");
+        require(stakedBalance[msg.sender] + count <= MAX_NFTS_PER_USER, "Exceeds max NFTs per user");
 
-        for (uint256 i = 0; i < tokenIds.length; i++) {
+        for (uint256 i = 0; i < count; i++) {
             uint256 tokenId = tokenIds[i];
             nftCollection.safeTransferFrom(msg.sender, address(this), tokenId);
             tokenOwner[tokenId] = msg.sender;
+            // O(1) index tracking
+            _tokenIdIndex[tokenId] = _stakedTokenIds[msg.sender].length;
             _stakedTokenIds[msg.sender].push(tokenId);
         }
 
-        stakedBalance[msg.sender] += tokenIds.length;
-        totalStaked += tokenIds.length;
+        stakedBalance[msg.sender] += count;
+        totalStaked += count;
 
         // Reset lock timer on every stake action
         stakeTimestamp[msg.sender] = block.timestamp;
 
-        emit Staked(msg.sender, tokenIds);
+        emit Staked(msg.sender, tokenIds, stakedBalance[msg.sender], totalStaked);
+
+        if (lockPeriod > 0) {
+            emit LockTimerReset(msg.sender, block.timestamp + lockPeriod);
+        }
     }
 
     /// @notice Unstake one or more NFTs
     /// @dev If lock period is active and user unstakes early, all pending rewards are forfeited.
     ///      If no lock or lock has expired, unstake freely with full rewards.
+    ///      NFT transfers happen AFTER all state changes (checks-effects-interactions).
     /// @param tokenIds Array of token IDs to unstake
     function unstake(uint256[] calldata tokenIds)
         external
         nonReentrant
         updateReward(msg.sender)
     {
-        require(tokenIds.length > 0, "No tokens");
+        uint256 count = tokenIds.length;
+        require(count > 0, "No tokens");
 
         bool earlyWithdrawal = isUserLocked(msg.sender);
 
@@ -342,24 +391,28 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
             }
         }
 
-        for (uint256 i = 0; i < tokenIds.length; i++) {
+        // --- State changes first (checks-effects-interactions) ---
+        for (uint256 i = 0; i < count; i++) {
             uint256 tokenId = tokenIds[i];
             require(tokenOwner[tokenId] == msg.sender, "Not your token");
-
             tokenOwner[tokenId] = address(0);
             _removeTokenId(msg.sender, tokenId);
-            nftCollection.safeTransferFrom(address(this), msg.sender, tokenId);
         }
 
-        stakedBalance[msg.sender] -= tokenIds.length;
-        totalStaked -= tokenIds.length;
+        stakedBalance[msg.sender] -= count;
+        totalStaked -= count;
 
         // Clear stake timestamp if fully unstaked
         if (stakedBalance[msg.sender] == 0) {
             stakeTimestamp[msg.sender] = 0;
         }
 
-        emit Unstaked(msg.sender, tokenIds, earlyWithdrawal);
+        // --- External calls last ---
+        for (uint256 i = 0; i < count; i++) {
+            nftCollection.safeTransferFrom(address(this), msg.sender, tokenIds[i]);
+        }
+
+        emit Unstaked(msg.sender, tokenIds, earlyWithdrawal, stakedBalance[msg.sender], totalStaked);
     }
 
     /// @notice Claim accrued rewards
@@ -371,7 +424,7 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         totalRewardsClaimed += reward;
         rewardToken.safeTransfer(msg.sender, reward);
 
-        emit RewardsClaimed(msg.sender, reward);
+        emit RewardsClaimed(msg.sender, reward, totalRewardsClaimed);
     }
 
     // ──────────────────────────────────────────────
@@ -388,7 +441,7 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
         require(balance > owedToStakers, "No withdrawable rewards");
         uint256 withdrawable = balance - owedToStakers;
         rewardToken.safeTransfer(owner, withdrawable);
-        emit CreatorWithdraw(owner, withdrawable);
+        emit CreatorWithdraw(owner, withdrawable, rewardToken.balanceOf(address(this)));
     }
 
     // ──────────────────────────────────────────────
@@ -398,28 +451,33 @@ contract StakingPool is IERC721Receiver, ReentrancyGuard, Pausable {
     /// @notice Pause the pool (emergency)
     function pause() external onlyFactory {
         _pause();
+        emit PoolPaused(msg.sender);
     }
 
     /// @notice Unpause the pool
     function unpause() external onlyFactory {
         _unpause();
+        emit PoolUnpaused(msg.sender);
     }
 
     // ──────────────────────────────────────────────
     //  Internal
     // ──────────────────────────────────────────────
 
-    /// @dev Remove a tokenId from a user's staked list (swap-and-pop)
+    /// @dev Remove a tokenId from a user's staked list — O(1) swap-and-pop with index tracking
     function _removeTokenId(address user, uint256 tokenId) internal {
         uint256[] storage ids = _stakedTokenIds[user];
-        for (uint256 i = 0; i < ids.length; i++) {
-            if (ids[i] == tokenId) {
-                ids[i] = ids[ids.length - 1];
-                ids.pop();
-                return;
-            }
+        uint256 index = _tokenIdIndex[tokenId];
+        uint256 lastIndex = ids.length - 1;
+
+        if (index != lastIndex) {
+            uint256 lastTokenId = ids[lastIndex];
+            ids[index] = lastTokenId;
+            _tokenIdIndex[lastTokenId] = index;
         }
-        revert("Token not found");
+
+        ids.pop();
+        delete _tokenIdIndex[tokenId];
     }
 
     /// @notice ERC-721 receiver hook

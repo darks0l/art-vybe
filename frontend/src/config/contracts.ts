@@ -1,8 +1,10 @@
-import StakingFactoryABI from "../abi/StakingFactory.json";
-import StakingPoolABI from "../abi/StakingPool.json";
-import FeeCollectorABI from "../abi/FeeCollector.json";
+import StakingFactoryArtifact from "../abi/StakingFactory.json";
+import StakingPoolArtifact from "../abi/StakingPool.json";
+import FeeCollectorArtifact from "../abi/FeeCollector.json";
 
-export { StakingFactoryABI, StakingPoolABI, FeeCollectorABI };
+export const StakingFactoryABI = StakingFactoryArtifact.abi;
+export const StakingPoolABI = StakingPoolArtifact.abi;
+export const FeeCollectorABI = FeeCollectorArtifact.abi;
 
 // Contract addresses per chain — fill in after deployment
 export const CONTRACT_ADDRESSES: Record<

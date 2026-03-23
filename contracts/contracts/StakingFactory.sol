@@ -8,12 +8,14 @@ import "@openzeppelin/contracts/proxy/Clones.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import "./StakingPool.sol";
 import "./FeeCollector.sol";
 
 /// @title StakingFactory
 /// @notice Deploys and registers Art Vybe NFT staking pools using the ERC-1167 minimal proxy pattern
-/// @dev Pool creators pay a fee (USDC or native token on chains without USDC) to create pools
+/// @dev Pool creators pay a fee (USDC or native token on chains without USDC) to create pools.
+///      Fee-on-transfer and rebasing tokens are explicitly rejected as reward tokens.
 contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -72,10 +74,17 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
         address indexed nftCollection,
         address rewardToken,
         uint256 totalRewards,
-        uint256 lockPeriodDays
+        uint256 lockPeriodDays,
+        string name,
+        uint256 poolIndex
     );
-    event CreationFeeUpdated(uint256 oldFee, uint256 newFee);
-    event FeeTokenUpdated(address oldToken, address newToken);
+    event CreationFeeUpdated(uint256 oldFee, uint256 newFee, address updatedBy);
+    event FeeTokenUpdated(address indexed oldToken, address indexed newToken, address updatedBy);
+    event FeeCollectorUpdated(address indexed oldCollector, address indexed newCollector, address updatedBy);
+    event FeeCollected(address indexed payer, address indexed token, uint256 amount);
+    event FeeRefunded(address indexed to, uint256 amount);
+    event PoolPausedByFactory(address indexed pool, address indexed pausedBy);
+    event PoolUnpausedByFactory(address indexed pool, address indexed unpausedBy);
 
     // ──────────────────────────────────────────────
     //  Constructor
@@ -105,8 +114,8 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
     // ──────────────────────────────────────────────
 
     /// @notice Create a new NFT staking pool
-    /// @param nftCollection  ERC-721 collection address
-    /// @param rewardToken    ERC-20 reward token address
+    /// @param nftCollection  ERC-721 collection address (must support ERC-165 + ERC-721)
+    /// @param rewardToken    ERC-20 reward token address (fee-on-transfer tokens rejected)
     /// @param totalRewards   Total reward tokens to distribute over 1 year
     /// @param lockPeriodDays Lock period in days (0 = no lock). Early unstake forfeits rewards.
     /// @param _name          Pool display name (e.g. "Bored Ape Staking")
@@ -130,14 +139,27 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
         require(bytes(_description).length <= 500, "Description: max 500 chars");
         require(bytes(_logoUrl).length <= 256, "Logo URL: max 256 chars");
 
+        // Validate NFT collection supports ERC-721 interface
+        try IERC165(nftCollection).supportsInterface(0x80ac58cd) returns (bool supported) {
+            require(supported, "Not a valid ERC-721 collection");
+        } catch {
+            revert("NFT contract does not support ERC-165");
+        }
+
         // --- Collect creation fee ---
         _collectFee();
 
         // --- Deploy clone ---
         pool = Clones.clone(poolImplementation);
 
-        // --- Transfer reward tokens from creator to the pool ---
+        // --- Transfer reward tokens (with fee-on-transfer protection) ---
+        uint256 balBefore = IERC20(rewardToken).balanceOf(pool);
         IERC20(rewardToken).safeTransferFrom(msg.sender, pool, totalRewards);
+        uint256 balAfter = IERC20(rewardToken).balanceOf(pool);
+        require(
+            balAfter - balBefore == totalRewards,
+            "Fee-on-transfer tokens not supported"
+        );
 
         // --- Initialize the pool ---
         StakingPool(pool).initialize(
@@ -149,6 +171,7 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
         );
 
         // --- Register ---
+        uint256 poolIndex = allPools.length;
         allPools.push(pool);
         poolsByCreator[msg.sender].push(pool);
         isPool[pool] = true;
@@ -165,7 +188,16 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
             logoUrl: _logoUrl
         });
 
-        emit PoolCreated(pool, msg.sender, nftCollection, rewardToken, totalRewards, lockPeriodDays);
+        emit PoolCreated(
+            pool,
+            msg.sender,
+            nftCollection,
+            rewardToken,
+            totalRewards,
+            lockPeriodDays,
+            _name,
+            poolIndex
+        );
     }
 
     // ──────────────────────────────────────────────
@@ -177,9 +209,26 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
         return allPools.length;
     }
 
-    /// @notice Returns all pool addresses
+    /// @notice Returns all pool addresses (use getPools for large sets)
     function getAllPools() external view returns (address[] memory) {
         return allPools;
+    }
+
+    /// @notice Returns a paginated slice of pool addresses
+    /// @param offset Starting index (0-based)
+    /// @param limit  Maximum number of pools to return
+    function getPools(uint256 offset, uint256 limit) external view returns (address[] memory pools) {
+        uint256 total = allPools.length;
+        if (offset >= total) return new address[](0);
+
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 size = end - offset;
+
+        pools = new address[](size);
+        for (uint256 i = 0; i < size; i++) {
+            pools[i] = allPools[offset + i];
+        }
     }
 
     /// @notice Returns pools created by a specific address
@@ -206,15 +255,23 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
     /// @notice Update the creation fee
     /// @param _newFee The new fee amount
     function setCreationFee(uint256 _newFee) external onlyOwner {
-        emit CreationFeeUpdated(creationFee, _newFee);
+        emit CreationFeeUpdated(creationFee, _newFee, msg.sender);
         creationFee = _newFee;
     }
 
     /// @notice Update the fee token (address(0) for native)
     /// @param _newToken The new fee token address
     function setFeeToken(address _newToken) external onlyOwner {
-        emit FeeTokenUpdated(feeToken, _newToken);
+        emit FeeTokenUpdated(feeToken, _newToken, msg.sender);
         feeToken = _newToken;
+    }
+
+    /// @notice Update the fee collector contract
+    /// @param _newCollector The new FeeCollector address
+    function setFeeCollector(address payable _newCollector) external onlyOwner {
+        require(_newCollector != address(0), "Invalid fee collector");
+        emit FeeCollectorUpdated(address(feeCollector), _newCollector, msg.sender);
+        feeCollector = FeeCollector(_newCollector);
     }
 
     /// @notice Pause the factory (disables new pool creation)
@@ -232,6 +289,7 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
     function pausePool(address pool) external onlyOwner {
         require(isPool[pool], "Not a pool");
         StakingPool(pool).pause();
+        emit PoolPausedByFactory(pool, msg.sender);
     }
 
     /// @notice Unpause a specific pool
@@ -239,6 +297,7 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
     function unpausePool(address pool) external onlyOwner {
         require(isPool[pool], "Not a pool");
         StakingPool(pool).unpause();
+        emit PoolUnpausedByFactory(pool, msg.sender);
     }
 
     // ──────────────────────────────────────────────
@@ -254,15 +313,18 @@ contract StakingFactory is Ownable, Pausable, ReentrancyGuard {
             require(msg.value >= creationFee, "Insufficient native fee");
             (bool success, ) = address(feeCollector).call{value: creationFee}("");
             require(success, "Fee transfer failed");
+            emit FeeCollected(msg.sender, address(0), creationFee);
             // Refund excess
             if (msg.value > creationFee) {
-                (bool refund, ) = msg.sender.call{value: msg.value - creationFee}("");
+                uint256 refundAmount = msg.value - creationFee;
+                (bool refund, ) = msg.sender.call{value: refundAmount}("");
                 require(refund, "Refund failed");
+                emit FeeRefunded(msg.sender, refundAmount);
             }
         } else {
             // ERC-20 fee — transfer from caller to fee collector
             IERC20(feeToken).safeTransferFrom(msg.sender, address(feeCollector), creationFee);
-            // Also update the fee collector's internal tracking
+            emit FeeCollected(msg.sender, feeToken, creationFee);
         }
     }
 }
